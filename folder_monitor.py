@@ -2,14 +2,50 @@
 import os
 import time
 import threading
+from datetime import datetime
+from typing import Any, Dict
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
-from watchdog.events import FileSystemEventHandler, PatternMatchingEventHandler
+from watchdog.events import PatternMatchingEventHandler
 from .folder_scanner import _scan_for_images  # Import folder scanner
-import asyncio
+from .metadata_extractor import buildMetadata
 from server import PromptServer
-import queue
 from .gallery_config import gallery_log
+
+# Module-level cache of file metadata
+FileInfo = Dict[str, Any]
+file_index: Dict[str, FileInfo] = {}
+
+
+def _build_file_info(base_path: str, real_path: str) -> FileInfo:
+    """Build metadata for a single file."""
+    timestamp = os.path.getmtime(real_path)
+    date_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    rel_dir = os.path.relpath(os.path.dirname(real_path), base_path)
+    filename = os.path.basename(real_path)
+    subfolder = rel_dir if rel_dir != "." else ""
+    if subfolder:
+        url_path = f"/static_gallery/{subfolder}/{filename}"
+    else:
+        url_path = f"/static_gallery/{filename}"
+    url_path = url_path.replace("\\", "/")
+
+    metadata = {}
+    if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        try:
+            _, _, metadata = buildMetadata(real_path)
+        except Exception as e:
+            gallery_log(f"Gallery Node: Error building metadata for {real_path}: {e}")
+            metadata = {}
+
+    return {
+        "name": filename,
+        "url": url_path,
+        "timestamp": timestamp,
+        "date": date_str,
+        "metadata": metadata,
+        "type": "image" if filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) else "media",
+    }
 
 
 class GalleryEventHandler(PatternMatchingEventHandler):
@@ -18,36 +54,63 @@ class GalleryEventHandler(PatternMatchingEventHandler):
     def __init__(self, base_path, patterns=None, ignore_patterns=None, ignore_directories=False, case_sensitive=True, debounce_interval=0.5):
         super().__init__(patterns=patterns, ignore_patterns=ignore_patterns, ignore_directories=ignore_directories, case_sensitive=case_sensitive)
         self.base_path = os.path.realpath(base_path)  # Use realpath for base_path
+        self.root_name = os.path.basename(self.base_path)
         self.debounce_timer = None
         self.debounce_interval = debounce_interval
         # Use a dictionary to track events, keyed by (event_type, real_path)
         self.processed_events = {}
-        self.result_queue = queue.Queue()  # Queue for results.
-        self.running_scan = False # Flag to avoid multiple scans at the same time
+        self.pending_changes = {"folders": {}}
 
     def on_any_event(self, event):
-        """Handles events, including symlinks, with debouncing and duplicate prevention."""
+        """Handle file system events and update the file index."""
         if event.is_directory:
             return
 
-        # Ignore temporary files
         if event.src_path.endswith(('.swp', '.tmp', '~')):
             return
 
         real_path = os.path.realpath(event.src_path)
 
-        # Check if this event (type + path) has been processed recently
         event_key = (event.event_type, real_path)
         current_time = time.time()
-
         if event_key in self.processed_events:
             last_processed_time = self.processed_events[event_key]
             if current_time - last_processed_time < self.debounce_interval:
                 return
-
-        # Mark this event as processed
         self.processed_events[event_key] = current_time
 
+        rel_path = os.path.relpath(real_path, self.base_path).replace("\\", "/")
+        folder_part = os.path.dirname(rel_path)
+        folder_key = self.root_name if folder_part in ("", ".") else os.path.join(self.root_name, folder_part).replace("\\", "/")
+        filename = os.path.basename(rel_path)
+
+        if event.event_type == 'deleted':
+            file_index.pop(rel_path, None)
+            self.pending_changes["folders"].setdefault(folder_key, {})[filename] = {"action": "remove"}
+        elif event.event_type == 'moved':
+            dest_real = os.path.realpath(event.dest_path)
+            dest_rel = os.path.relpath(dest_real, self.base_path).replace("\\", "/")
+            dest_folder_part = os.path.dirname(dest_rel)
+            dest_folder_key = self.root_name if dest_folder_part in ("", ".") else os.path.join(self.root_name, dest_folder_part).replace("\\", "/")
+            dest_filename = os.path.basename(dest_rel)
+
+            file_index.pop(rel_path, None)
+            self.pending_changes["folders"].setdefault(folder_key, {})[filename] = {"action": "remove"}
+
+            try:
+                file_info = _build_file_info(self.base_path, dest_real)
+                file_index[dest_rel] = file_info
+                self.pending_changes["folders"].setdefault(dest_folder_key, {})[dest_filename] = {"action": "create", **file_info}
+            except Exception as e:
+                gallery_log(f"GalleryEventHandler: Error processing moved file {dest_real}: {e}")
+        else:
+            action = "create" if event.event_type == "created" else "update"
+            try:
+                file_info = _build_file_info(self.base_path, real_path)
+                file_index[rel_path] = file_info
+                self.pending_changes["folders"].setdefault(folder_key, {})[filename] = {"action": action, **file_info}
+            except Exception as e:
+                gallery_log(f"GalleryEventHandler: Error processing file {real_path}: {e}")
 
         if event.event_type in ('created', 'deleted', 'modified', 'moved'):
             gallery_log(f"Watchdog detected {event.event_type}: {event.src_path} (Real path: {real_path}) - debouncing")
@@ -63,66 +126,19 @@ class GalleryEventHandler(PatternMatchingEventHandler):
         self.debounce_timer.start()
 
     def rescan_and_send_changes(self):
-        """Rescans, detects changes, sends updates, now thread-safe."""
-        if self.running_scan:
-            gallery_log("Another scan is running, skipping")
+        """Send pending changes to clients without rescanning."""
+        if not self.pending_changes["folders"]:
+            self.debounce_timer = None
             return
 
-        self.running_scan = True  # Set the flag.
-
-        def thread_target():
-            """Target function for the scanning thread."""
-
-            try:
-                folder_name = os.path.basename(self.base_path)
-                new_folders_data, _ = _scan_for_images(self.base_path, folder_name, True)
-                old_folders_data = self.last_known_folders
-                changes = detect_folder_changes(old_folders_data, new_folders_data)
-
-                # Put results and last_known_folders into the queue.
-                self.result_queue.put((changes, new_folders_data))
-
-
-            except Exception as e:
-                # Put any exception into the queue for the main thread to handle.
-                self.result_queue.put(e)
-
-
-        def on_scan_complete():
-            """Callback to run in the main thread after scanning."""
-            try:
-
-                result = self.result_queue.get()  # Use get - BLOCKING
-
-                if isinstance(result, Exception):
-                    gallery_log(f"FileSystemMonitor: Error during scan: {result}")
-                    return
-
-                changes, new_folders_data = result
-
-                if changes:
-                    gallery_log("FileSystemMonitor: Changes detected after debounce, sending updates")
-                    from .server import sanitize_json_data
-                    # Correctly schedule the send_sync call on the main thread.
-                    PromptServer.instance.send_sync("Gallery.file_change", sanitize_json_data(changes)) # NO ASYNCIO NEEDED
-                else:
-                    gallery_log("FileSystemMonitor: Changes detected by watchdog, but no relevant gallery changes after debounce.")
-
-                self.last_known_folders = new_folders_data  # Update last_known_folders.
-                self.debounce_timer = None
-            except queue.Empty:
-                gallery_log("FileSystemMonitor: Queue is empty, this shouldn't happen normally.")
-
-            finally:
-                self.running_scan = False #Clear flag in all cases
-
-        # Start the scan in a separate thread.
-        scan_thread = threading.Thread(target=thread_target)
-        scan_thread.start()
-
-        #Schedule the callback to be called when the scan is complete.
-        scan_thread.join() # Wait for the scan thread to actually complete!
-        on_scan_complete() # THEN call the completion function, now guaranteed to have data.
+        try:
+            from .server import sanitize_json_data
+            PromptServer.instance.send_sync("Gallery.file_change", sanitize_json_data(self.pending_changes))
+        except Exception as e:
+            gallery_log(f"FileSystemMonitor: Error sending changes: {e}")
+        finally:
+            self.pending_changes = {"folders": {}}
+            self.debounce_timer = None
 
 
 
@@ -139,7 +155,12 @@ class FileSystemMonitor:
             self.observer = PollingObserver()
         self.event_handler = GalleryEventHandler(base_path=base_path, patterns=["*.png", "*.jpg", "*.jpeg", "*.webp", "*.mp4", "*.gif", "*.webm"], debounce_interval=0.5)
         folder_name = os.path.basename(base_path)
-        self.event_handler.last_known_folders, _ = _scan_for_images(base_path, folder_name, True)
+        folders_data, _ = _scan_for_images(base_path, folder_name, True)
+        for folder, files in folders_data.items():
+            rel_dir = os.path.relpath(folder, folder_name)
+            for filename, info in files.items():
+                rel_path = os.path.join(rel_dir, filename) if rel_dir != '.' else filename
+                file_index[rel_path.replace("\\", "/")] = info
         self.thread = None
 
     def start_monitoring(self):
@@ -171,36 +192,3 @@ class FileSystemMonitor:
             gallery_log("FileSystemMonitor: Watchdog monitoring thread stopped.")
         else:
             gallery_log("FileSystemMonitor: Watchdog monitoring thread was not running.")
-
-
-
-# --- Helper function to detect folder changes ---
-def detect_folder_changes(old_folders, new_folders):
-    """Detects changes between two folder data dictionaries."""
-    changes = {"folders": {}}
-
-    all_folders = set(old_folders.keys()) | set(new_folders.keys())
-    for folder_name in all_folders:
-        old_folder = old_folders.get(folder_name, {})
-        new_folder = new_folders.get(folder_name, {})
-        folder_changes = {}
-
-        old_files = set(old_folder.keys())
-        new_files = set(new_folder.keys())
-        all_files = old_files | new_files
-
-        for filename in all_files:
-            old_file_data = old_folder.get(filename)
-            new_file_data = new_folder.get(filename)
-
-            if filename not in old_folder: # New file
-                folder_changes[filename] = {"action": "create", **new_file_data}
-            elif filename not in new_folder: # Removed file
-                folder_changes[filename] = {"action": "remove"}
-            elif old_file_data != new_file_data: # Updated file (simplistic comparison)
-                folder_changes[filename] = {"action": "update", **new_file_data}
-
-        if folder_changes:
-            changes["folders"][folder_name] = folder_changes
-
-    return changes
