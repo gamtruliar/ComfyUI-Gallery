@@ -14,26 +14,25 @@ def _scan_for_images(full_base_path, base_path, include_subfolders):
         nonlocal changed
         folder_content = {}  # Dictionary to hold files for the current folder
         try:
-            entries = os.listdir(dir_path)
             file_entries = []
 
-            for entry in entries:
-                full_path = os.path.join(dir_path, entry)
-                if os.path.isdir(full_path):
-                    if include_subfolders and not entry.startswith("."):
-                        next_relative_path = os.path.join(relative_path, entry)
-                        scan_directory(full_path, next_relative_path)
-                elif os.path.isfile(full_path):
-                    file_entries.append((full_path, entry))
-                    current_files.add(full_path)
+            for entry in os.scandir(dir_path):
+                if entry.is_dir():
+                    if include_subfolders and not entry.name.startswith("."):
+                        next_relative_path = os.path.join(relative_path, entry.name)
+                        scan_directory(entry.path, next_relative_path)
+                elif entry.is_file():
+                    file_entries.append(entry)
+                    current_files.add(entry.path)
 
-            for full_path, entry in file_entries:
-                if entry.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.mp4', '.gif', '.webm')): # ADDED: .mp4 and .gif extensions
+            for entry in file_entries:
+                name = entry.name
+                if name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.mp4', '.gif', '.webm')): # ADDED: .mp4 and .gif extensions
                     try:
-                        timestamp = os.path.getmtime(full_path)
+                        timestamp = entry.stat().st_mtime
                         date_str = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
                         rel_path = os.path.relpath(dir_path, full_base_path)
-                        filename = entry
+                        filename = name
                         subfolder = rel_path if rel_path != "." else ""
                         if len(subfolder) > 0:
                           url_path = f"/static_gallery/{subfolder}/{filename}"
@@ -42,24 +41,24 @@ def _scan_for_images(full_base_path, base_path, include_subfolders):
                         url_path = url_path.replace("\\", "/")
 
                         metadata = {} # Videos and GIFs will have empty metadata for now
-                        if entry.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')): # Only build metadata for images
+                        if name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')): # Only build metadata for images
                             # Extract metadata here
                             try:
-                                _, _, metadata = buildMetadata(full_path)
+                                _, _, metadata = buildMetadata(entry.path)
                             except Exception as e:
-                                print(f"Gallery Node: Error building metadata for {full_path}: {e}")
+                                print(f"Gallery Node: Error building metadata for {entry.path}: {e}")
                                 metadata = {}
 
                         folder_content[filename] = { # Store file info in folder_content dict
-                            "name": entry,
+                            "name": name,
                             "url": url_path,
                             "timestamp": timestamp,
                             "date": date_str,
                             "metadata": metadata,
-                            "type": "image" if entry.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) else "media" # Added type to distinguish images and media
+                            "type": "image" if name.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')) else "media" # Added type to distinguish images and media
                         }
                     except Exception as e:
-                        print(f"Gallery Node: Error processing file {full_path}: {e}")
+                        print(f"Gallery Node: Error processing file {entry.path}: {e}")
 
             folder_key = os.path.join(base_path, relative_path) if relative_path else base_path
             if folder_content: # Only add folder if it has content
